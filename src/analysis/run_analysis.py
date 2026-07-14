@@ -9,9 +9,11 @@ from __future__ import annotations
 import logging
 from csv import reader
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import pandas as pd
+
+from .run_analysis_cohort_shared import run_cohort_shared_snv_analysis
 
 # Rust analysis (required; no Python fallback)
 try:
@@ -138,7 +140,12 @@ def run_ai_analysis(
     region_col: str | None = None,
     groupby: str | None = None,
     per_variant: bool = False,
-) -> None:
+    scope: str | None = None,
+    unit: str | None = None,
+    min_donor_observations: int = 50,
+    min_informative_donors: int = 3,
+    expected_sha256: str | None = None,
+) -> dict[str, Path] | None:
     """Run allelic imbalance analysis pipeline.
 
     Parameters
@@ -152,7 +159,8 @@ def run_ai_analysis(
     phased : bool | None, optional
         Use phased genotype information, by default False.
     model : str | None, optional
-        Dispersion model ('single' or 'linear'), by default 'single'.
+        Dispersion model. Legacy analysis accepts 'single' or 'linear'; cohort-shared
+        SNVs also accept 'per-donor', which is their default.
     out_file : str | None, optional
         Output file path, by default 'ai_results.tsv'.
     region_col : str | None, optional
@@ -168,6 +176,33 @@ def run_ai_analysis(
     RuntimeError
         If Rust analysis extension is not available.
     """
+    if scope is not None:
+        if scope != "cohort-shared":
+            raise ValueError("scope must be 'cohort-shared'")
+        if unit != "snv":
+            raise ValueError("Cohort-shared analysis requires --unit snv")
+        if phased:
+            raise ValueError("Cohort-shared SNV analysis is unphased; --phased is not valid")
+        if region_col is not None or groupby is not None or per_variant:
+            raise ValueError("Cohort-shared SNVs are grouped by exact alleles automatically")
+        cohort_model = "per-donor" if model is None else model
+        if cohort_model not in {"single", "linear", "per-donor"}:
+            raise ValueError("Cohort-shared SNV model must be 'single', 'linear', or 'per-donor'")
+        output = out_file if out_file is not None else str(Path.cwd() / "ai_results.tsv")
+        return run_cohort_shared_snv_analysis(
+            count_file,
+            output,
+            model=cast(Literal["single", "linear", "per-donor"], cohort_model),
+            min_count=10 if min_count is None else min_count,
+            pseudocount=1 if pseudocount is None else pseudocount,
+            min_donor_observations=min_donor_observations,
+            min_informative_donors=min_informative_donors,
+            expected_sha256=expected_sha256,
+        )
+
+    if unit is not None:
+        raise ValueError("--unit requires --scope cohort-shared")
+
     # Fail closed: --groupby is not supported by the Rust backend. It only re-keys the grouping
     # column (region_col = groupby), so the identical result is obtained with --region_col <parent>.
     # Erroring prevents silently returning feature-level results when parent-level was requested.

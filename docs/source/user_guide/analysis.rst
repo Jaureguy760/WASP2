@@ -28,10 +28,43 @@ Useful options:
 
 * ``--min`` / ``--min_count``: minimum total count threshold
 * ``--pseudocount``: pseudocount added before modeling
-* ``--model``: dispersion model (currently ``single`` or ``linear`` input)
+* ``--model``: dispersion model (``single`` or ``linear`` for legacy bulk analysis)
 * ``--output`` / ``--out_file`` / ``-o``: output TSV path
 * ``--region_col``: explicit region column name if auto-detection is not desired
 * ``--groupby``: group on an alternate annotation column, such as a parent gene column
+
+Cohort-Shared ATAC SNVs
+-----------------------
+
+Use cohort-shared scope to estimate one allelic proportion for each exact SNV
+across donors while retaining donor identity in the likelihood:
+
+.. code-block:: bash
+
+   wasp2-analyze find-imbalance \
+     atac_snv_counts.tsv.gz \
+     --scope cohort-shared \
+     --unit snv \
+     --model per-donor \
+     --min-donor-observations 50 \
+     --min-informative-donors 3 \
+     --output cohort_snv.tsv
+
+The input must contain ``sample``, ``snv_id``, ``chrom``, ``pos``, ``ref``,
+``alt``, ``ref_count``, and ``alt_count``. The available dispersion models are:
+
+* ``single``: one dispersion estimate shared by the cohort
+* ``linear``: one cohort-fitted depth-dependent dispersion function
+* ``per-donor``: one dispersion estimate per included donor (default)
+
+All three models estimate dispersion from eligible count observations at run
+time and estimate one shared effect per SNV. SNV inference is unphased;
+``--phased`` is rejected for this scope. Benjamini-Hochberg correction is
+applied across all tested SNVs within the run.
+
+The command writes the requested result TSV plus sibling ``.dispersion.tsv``,
+``.qc.tsv``, and ``.provenance.json`` artifacts. Existing artifacts are never
+overwritten.
 
 Single-Cell Analysis
 --------------------
@@ -88,7 +121,7 @@ Defaults and contracts
 - Beta-binomial LRT: :math:`\rho` is held at its **null-model MLE** while
   maximizing the alternative likelihood over :math:`\mu` (profile likelihood,
   df = 1). :math:`\rho` is not jointly re-estimated under :math:`H_1`.
-- Dispersion optimizer bounds :math:`\rho \in (10^{-6},\, 1-10^{-6})`; the
+- Dispersion optimizer bounds :math:`\rho \in (10^{-10},\, 1-10^{-10})`; the
   linear-dispersion model clips the logit at :math:`\pm 10` for numerical
   stability on extreme :math:`N`.
 - FDR correction uses :func:`scipy.stats.false_discovery_control` with

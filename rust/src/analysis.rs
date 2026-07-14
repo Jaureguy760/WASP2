@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use rv::dist::BetaBinomial;
 use rv::traits::HasDensity;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // ============================================================================
 // Data Structures
@@ -74,6 +74,97 @@ pub enum AnalysisMethod {
     Single,   // Single global dispersion parameter
     Linear,   // Linear dispersion model: rho = expit(d1 + N*d2)
     PerDonor, // Per-donor dispersion: rho fit separately per sample
+}
+
+/// One donor/SNV count observation for cohort-shared SNV inference.
+#[derive(Debug, Clone)]
+pub struct CohortSnvObservation {
+    pub sample: String,
+    pub snv_id: String,
+    pub chrom: String,
+    pub pos: u32,
+    pub ref_allele: String,
+    pub alt_allele: String,
+    pub ref_count: u32,
+    pub alt_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CohortSnvMethod {
+    Single,
+    Linear,
+    PerDonor,
+}
+
+#[derive(Debug, Clone)]
+pub struct CohortSnvConfig {
+    pub min_count: u32,
+    pub pseudocount: u32,
+    pub min_donor_observations: usize,
+    pub min_informative_donors: usize,
+    pub method: CohortSnvMethod,
+}
+
+#[derive(Debug, Clone)]
+pub struct CohortSnvResult {
+    pub snv_id: String,
+    pub chrom: String,
+    pub pos: u32,
+    pub ref_allele: String,
+    pub alt_allele: String,
+    pub ref_count: u64,
+    pub alt_count: u64,
+    pub n: u64,
+    pub donor_count: usize,
+    pub null_ll: f64,
+    pub alt_ll: f64,
+    pub mu: f64,
+    pub lrt: f64,
+    pub pval: f64,
+    pub fdr_pval: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DonorQc {
+    pub sample: String,
+    pub raw_observations: usize,
+    pub eligible_observations: usize,
+    pub included: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DonorDispersion {
+    pub sample: String,
+    pub rho: f64,
+    pub n_observations: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CohortSnvOutput {
+    pub results: Vec<CohortSnvResult>,
+    pub donor_qc: Vec<DonorQc>,
+    pub donor_dispersion: Vec<DonorDispersion>,
+    pub global_rho: Option<f64>,
+    pub linear_params: Option<(f64, f64)>,
+    pub n_raw_observations: usize,
+    pub n_included_observations: usize,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct SnvKey {
+    chrom: String,
+    pos: u32,
+    ref_allele: String,
+    alt_allele: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCohortSnvObservation {
+    sample: String,
+    snv_id: String,
+    key: SnvKey,
+    ref_count: u32,
+    alt_count: u32,
 }
 
 impl Default for AnalysisConfig {
@@ -246,9 +337,10 @@ fn optimize_dispersion(ref_counts: &[u32], n_array: &[u32]) -> Result<f64> {
         }
     };
 
-    // Use golden section search (simple but effective)
-    let result = golden_section_search(objective, 0.001, 0.999, 1e-6)?;
-    Ok(result)
+    // Match scipy.optimize.minimize_scalar(method="bounded") used by AHO.
+    // Sparse donors can have an MLE below 0.001; imposing that floor changes
+    // the null likelihood and every downstream p-value.
+    scipy_bounded_minimize(objective, 0.0, 1.0, 1e-5, 500)
 }
 
 /// Optimize linear dispersion parameters using Nelder-Mead
@@ -502,6 +594,101 @@ fn logaddexp(a: f64, b: f64) -> f64 {
     }
 }
 
+/// Bounded Brent minimizer matching SciPy's scalar-bounded routine.
+fn scipy_bounded_minimize<F>(f: F, x1: f64, x2: f64, xatol: f64, maxfun: usize) -> Result<f64>
+where
+    F: Fn(f64) -> f64,
+{
+    if !x1.is_finite() || !x2.is_finite() || x1 > x2 {
+        anyhow::bail!("invalid bounded optimization interval");
+    }
+    let sqrt_eps = (2.2e-16_f64).sqrt();
+    let golden_mean = 0.5 * (3.0 - 5.0_f64.sqrt());
+    let (mut a, mut b) = (x1, x2);
+    let mut fulc = a + golden_mean * (b - a);
+    let (mut nfc, mut xf) = (fulc, fulc);
+    let (mut rat, mut e) = (0.0_f64, 0.0_f64);
+    let mut fx = f(xf);
+    let (mut ffulc, mut fnfc) = (fx, fx);
+    let mut fu = f64::INFINITY;
+    let mut calls = 1_usize;
+    let mut xm = 0.5 * (a + b);
+    let mut tol1 = sqrt_eps * xf.abs() + xatol / 3.0;
+    let mut tol2 = 2.0 * tol1;
+
+    while (xf - xm).abs() > tol2 - 0.5 * (b - a) {
+        let mut golden = true;
+        if e.abs() > tol1 {
+            let r = (xf - nfc) * (fx - ffulc);
+            let q0 = (xf - fulc) * (fx - fnfc);
+            let mut p = (xf - fulc) * q0 - (xf - nfc) * r;
+            let mut q = 2.0 * (q0 - r);
+            if q > 0.0 {
+                p = -p;
+            }
+            q = q.abs();
+            let previous_e = e;
+            e = rat;
+            if p.abs() < (0.5 * q * previous_e).abs() && p > q * (a - xf) && p < q * (b - xf) {
+                rat = p / q;
+                let candidate = xf + rat;
+                if candidate - a < tol2 || b - candidate < tol2 {
+                    rat = tol1 * if xm - xf >= 0.0 { 1.0 } else { -1.0 };
+                }
+                golden = false;
+            }
+        }
+        if golden {
+            e = if xf >= xm { a - xf } else { b - xf };
+            rat = golden_mean * e;
+        }
+
+        let direction = if rat >= 0.0 { 1.0 } else { -1.0 };
+        let x = xf + direction * rat.abs().max(tol1);
+        fu = f(x);
+        calls += 1;
+        if fu <= fx {
+            if x >= xf {
+                a = xf;
+            } else {
+                b = xf;
+            }
+            fulc = nfc;
+            ffulc = fnfc;
+            nfc = xf;
+            fnfc = fx;
+            xf = x;
+            fx = fu;
+        } else {
+            if x < xf {
+                a = x;
+            } else {
+                b = x;
+            }
+            if fu <= fnfc || nfc == xf {
+                fulc = nfc;
+                ffulc = fnfc;
+                nfc = x;
+                fnfc = fu;
+            } else if fu <= ffulc || fulc == xf || fulc == nfc {
+                fulc = x;
+                ffulc = fu;
+            }
+        }
+
+        xm = 0.5 * (a + b);
+        tol1 = sqrt_eps * xf.abs() + xatol / 3.0;
+        tol2 = 2.0 * tol1;
+        if calls >= maxfun {
+            anyhow::bail!("bounded scalar optimization exceeded {maxfun} evaluations");
+        }
+    }
+    if !xf.is_finite() || !fx.is_finite() || fu.is_nan() {
+        anyhow::bail!("bounded scalar optimization produced a non-finite result");
+    }
+    Ok(xf)
+}
+
 /// Golden section search for 1D optimization
 ///
 /// Simple but robust method for bounded scalar optimization.
@@ -684,6 +871,301 @@ pub fn fdr_correction(pvals: &[f64]) -> Vec<f64> {
     }
 
     adjusted
+}
+
+fn valid_snv_allele(allele: &str) -> bool {
+    allele.len() == 1
+        && matches!(
+            allele.as_bytes()[0].to_ascii_uppercase(),
+            b'A' | b'C' | b'G' | b'T'
+        )
+}
+
+fn cohort_prob_nll(
+    prob: f64,
+    indices: &[usize],
+    observations: &[PreparedCohortSnvObservation],
+    row_rho: &[f64],
+) -> f64 {
+    indices
+        .iter()
+        .map(|&index| {
+            let observation = &observations[index];
+            let n = observation.ref_count + observation.alt_count;
+            opt_prob(prob, row_rho[index], observation.ref_count, n).unwrap_or(f64::INFINITY)
+        })
+        .sum()
+}
+
+/// Run an unphased cohort SNV analysis with one shared effect per exact SNV.
+///
+/// Dispersion is estimated from all eligible observations for `Single` and
+/// `Linear`, or independently within each included donor for `PerDonor`.
+/// Donor identity is retained throughout filtering and likelihood evaluation.
+pub fn analyze_cohort_snvs(
+    observations: Vec<CohortSnvObservation>,
+    config: &CohortSnvConfig,
+) -> Result<CohortSnvOutput> {
+    if observations.is_empty() {
+        anyhow::bail!("cohort SNV table contains no observations");
+    }
+    if config.min_donor_observations == 0 || config.min_informative_donors == 0 {
+        anyhow::bail!("donor observation thresholds must be positive");
+    }
+
+    let n_raw_observations = observations.len();
+    let mut seen_observations = HashSet::with_capacity(observations.len());
+    let mut id_to_key: HashMap<String, SnvKey> = HashMap::new();
+    let mut key_to_id: HashMap<SnvKey, String> = HashMap::new();
+    let mut donor_counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut eligible = Vec::with_capacity(observations.len());
+
+    for observation in observations {
+        if observation.sample.is_empty()
+            || observation.snv_id.is_empty()
+            || observation.chrom.is_empty()
+        {
+            anyhow::bail!("sample, snv_id, and chromosome must be non-empty");
+        }
+        if observation.pos == 0 {
+            anyhow::bail!("SNV positions must be one-based");
+        }
+        if !valid_snv_allele(&observation.ref_allele)
+            || !valid_snv_allele(&observation.alt_allele)
+            || observation
+                .ref_allele
+                .eq_ignore_ascii_case(&observation.alt_allele)
+        {
+            anyhow::bail!(
+                "cohort SNV analysis requires distinct single-base A/C/G/T REF and ALT alleles"
+            );
+        }
+
+        let key = SnvKey {
+            chrom: observation.chrom,
+            pos: observation.pos,
+            ref_allele: observation.ref_allele.to_ascii_uppercase(),
+            alt_allele: observation.alt_allele.to_ascii_uppercase(),
+        };
+        let observation_key = (
+            observation.sample.clone(),
+            key.chrom.clone(),
+            key.pos,
+            key.ref_allele.clone(),
+            key.alt_allele.clone(),
+        );
+        if !seen_observations.insert(observation_key) {
+            anyhow::bail!(
+                "duplicate donor/SNV observation for {} {}:{} {}>{}",
+                observation.sample,
+                key.chrom,
+                key.pos,
+                key.ref_allele,
+                key.alt_allele
+            );
+        }
+        if let Some(existing) = id_to_key.get(&observation.snv_id) {
+            if existing != &key {
+                anyhow::bail!(
+                    "snv_id maps to more than one exact SNV: {}",
+                    observation.snv_id
+                );
+            }
+        } else {
+            id_to_key.insert(observation.snv_id.clone(), key.clone());
+        }
+        if let Some(existing) = key_to_id.get(&key) {
+            if existing != &observation.snv_id {
+                anyhow::bail!(
+                    "exact SNV maps to conflicting snv_id values: {} and {}",
+                    existing,
+                    observation.snv_id
+                );
+            }
+        } else {
+            key_to_id.insert(key.clone(), observation.snv_id.clone());
+        }
+
+        let counts = donor_counts
+            .entry(observation.sample.clone())
+            .or_insert((0, 0));
+        counts.0 += 1;
+        let raw_n = observation
+            .ref_count
+            .checked_add(observation.alt_count)
+            .context("allelic count depth overflow")?;
+        if raw_n < config.min_count {
+            continue;
+        }
+        counts.1 += 1;
+        let ref_count = observation
+            .ref_count
+            .checked_add(config.pseudocount)
+            .context("reference count plus pseudocount overflow")?;
+        let alt_count = observation
+            .alt_count
+            .checked_add(config.pseudocount)
+            .context("alternate count plus pseudocount overflow")?;
+        eligible.push(PreparedCohortSnvObservation {
+            sample: observation.sample,
+            snv_id: observation.snv_id,
+            key,
+            ref_count,
+            alt_count,
+        });
+    }
+
+    let included_samples: BTreeSet<String> = donor_counts
+        .iter()
+        .filter(|(_, (_, eligible_count))| *eligible_count >= config.min_donor_observations)
+        .map(|(sample, _)| sample.clone())
+        .collect();
+    if included_samples.is_empty() {
+        anyhow::bail!("no donors meet the minimum eligible-observation threshold");
+    }
+    let donor_qc: Vec<DonorQc> = donor_counts
+        .iter()
+        .map(|(sample, (raw, eligible_count))| DonorQc {
+            sample: sample.clone(),
+            raw_observations: *raw,
+            eligible_observations: *eligible_count,
+            included: included_samples.contains(sample),
+        })
+        .collect();
+    eligible.retain(|observation| included_samples.contains(&observation.sample));
+    if eligible.is_empty() {
+        anyhow::bail!("no eligible observations remain after donor filtering");
+    }
+    let n_included_observations = eligible.len();
+
+    let ref_counts: Vec<u32> = eligible
+        .iter()
+        .map(|observation| observation.ref_count)
+        .collect();
+    let n_array: Vec<u32> = eligible
+        .iter()
+        .map(|observation| observation.ref_count + observation.alt_count)
+        .collect();
+    let mut donor_dispersion = Vec::new();
+    let (row_rho, global_rho, linear_params) = match config.method {
+        CohortSnvMethod::Single => {
+            let rho = optimize_dispersion(&ref_counts, &n_array)?;
+            (vec![rho; eligible.len()], Some(rho), None)
+        }
+        CohortSnvMethod::Linear => {
+            let (d1, d2) = optimize_dispersion_linear(&ref_counts, &n_array)?;
+            let row_rho = n_array
+                .iter()
+                .map(|&n| clamp_rho(expit((d1 + n as f64 * d2).clamp(-10.0, 10.0))))
+                .collect();
+            (row_rho, None, Some((d1, d2)))
+        }
+        CohortSnvMethod::PerDonor => {
+            let mut donor_indices: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            for (index, observation) in eligible.iter().enumerate() {
+                donor_indices
+                    .entry(&observation.sample)
+                    .or_default()
+                    .push(index);
+            }
+            let mut row_rho = vec![f64::NAN; eligible.len()];
+            for (sample, indices) in donor_indices {
+                let donor_ref: Vec<u32> = indices.iter().map(|&index| ref_counts[index]).collect();
+                let donor_n: Vec<u32> = indices.iter().map(|&index| n_array[index]).collect();
+                let rho = optimize_dispersion(&donor_ref, &donor_n)?;
+                for &index in &indices {
+                    row_rho[index] = rho;
+                }
+                donor_dispersion.push(DonorDispersion {
+                    sample: sample.to_string(),
+                    rho,
+                    n_observations: indices.len(),
+                });
+            }
+            (row_rho, None, None)
+        }
+    };
+
+    let mut snv_indices: BTreeMap<SnvKey, Vec<usize>> = BTreeMap::new();
+    for (index, observation) in eligible.iter().enumerate() {
+        snv_indices
+            .entry(observation.key.clone())
+            .or_default()
+            .push(index);
+    }
+    snv_indices.retain(|_, indices| indices.len() >= config.min_informative_donors);
+    if snv_indices.is_empty() {
+        anyhow::bail!("no SNVs meet the minimum informative-donor threshold");
+    }
+
+    let chi2 = ChiSquared::new(1.0).context("failed to create chi-squared distribution")?;
+    let pseudocount = config.pseudocount as u64;
+    let results: Result<Vec<CohortSnvResult>> = snv_indices
+        .par_iter()
+        .map(|(key, indices)| {
+            let objective = |prob: f64| cohort_prob_nll(prob, indices, &eligible, &row_rho);
+            let null_ll = -objective(0.5);
+            let mu = golden_section_search(objective, 0.0, 1.0, 1e-6)?;
+            let alt_ll = -objective(mu);
+            if !null_ll.is_finite() || !alt_ll.is_finite() || !mu.is_finite() {
+                anyhow::bail!("non-finite likelihood for {}:{}", key.chrom, key.pos);
+            }
+            let lrt = (2.0 * (alt_ll - null_ll)).max(0.0);
+            let pval = 1.0 - chi2.cdf(lrt);
+            let donor_count = indices.len();
+            let ref_with_pc: u64 = indices
+                .iter()
+                .map(|&index| eligible[index].ref_count as u64)
+                .sum();
+            let alt_with_pc: u64 = indices
+                .iter()
+                .map(|&index| eligible[index].alt_count as u64)
+                .sum();
+            let total_pc = pseudocount * donor_count as u64;
+            let ref_count = ref_with_pc.saturating_sub(total_pc);
+            let alt_count = alt_with_pc.saturating_sub(total_pc);
+            Ok(CohortSnvResult {
+                snv_id: eligible[indices[0]].snv_id.clone(),
+                chrom: key.chrom.clone(),
+                pos: key.pos,
+                ref_allele: key.ref_allele.clone(),
+                alt_allele: key.alt_allele.clone(),
+                ref_count,
+                alt_count,
+                n: ref_count + alt_count,
+                donor_count,
+                null_ll,
+                alt_ll,
+                mu,
+                lrt,
+                pval,
+                fdr_pval: 0.0,
+            })
+        })
+        .collect();
+    let mut results = results?;
+    results.sort_by(|left, right| {
+        (&left.chrom, left.pos, &left.ref_allele, &left.alt_allele).cmp(&(
+            &right.chrom,
+            right.pos,
+            &right.ref_allele,
+            &right.alt_allele,
+        ))
+    });
+    let adjusted = fdr_correction(&results.iter().map(|result| result.pval).collect::<Vec<_>>());
+    for (result, fdr_pval) in results.iter_mut().zip(adjusted) {
+        result.fdr_pval = fdr_pval;
+    }
+
+    Ok(CohortSnvOutput {
+        results,
+        donor_qc,
+        donor_dispersion,
+        global_rho,
+        linear_params,
+        n_raw_observations,
+        n_included_observations,
+    })
 }
 
 // ============================================================================
@@ -1312,6 +1794,14 @@ mod tests {
     }
 
     #[test]
+    fn test_scipy_bounded_minimize_preserves_near_zero_solution() {
+        let minimum = scipy_bounded_minimize(|rho| rho, 0.0, 1.0, 1e-5, 500).unwrap();
+        let scipy_boundary = 5.9608609865491405e-6;
+        assert!((minimum - scipy_boundary).abs() < 1e-15);
+        assert!(minimum < 0.001);
+    }
+
+    #[test]
     fn test_optimize_prob_unphased_dp_single_position() {
         // Test with only first position (no subsequent positions)
         let disp = vec![0.1];
@@ -1502,5 +1992,110 @@ mod tests {
             ra[0].lrt,
             rb[0].lrt
         );
+    }
+
+    fn cohort_observation(
+        sample: &str,
+        snv_id: &str,
+        pos: u32,
+        ref_count: u32,
+        alt_count: u32,
+    ) -> CohortSnvObservation {
+        CohortSnvObservation {
+            sample: sample.to_string(),
+            snv_id: snv_id.to_string(),
+            chrom: "chr1".to_string(),
+            pos,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+            ref_count,
+            alt_count,
+        }
+    }
+
+    fn cohort_fixture() -> Vec<CohortSnvObservation> {
+        vec![
+            cohort_observation("d1", "s1", 101, 18, 2),
+            cohort_observation("d1", "s2", 202, 10, 10),
+            cohort_observation("d2", "s1", 101, 16, 4),
+            cohort_observation("d2", "s2", 202, 9, 11),
+            cohort_observation("d3", "s1", 101, 19, 1),
+            cohort_observation("d3", "s2", 202, 11, 9),
+        ]
+    }
+
+    fn cohort_config(method: CohortSnvMethod) -> CohortSnvConfig {
+        CohortSnvConfig {
+            min_count: 10,
+            pseudocount: 1,
+            min_donor_observations: 2,
+            min_informative_donors: 3,
+            method,
+        }
+    }
+
+    #[test]
+    fn test_cohort_per_donor_uses_shared_effect_and_preserves_raw_counts() {
+        let output =
+            analyze_cohort_snvs(cohort_fixture(), &cohort_config(CohortSnvMethod::PerDonor))
+                .unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(output.donor_dispersion.len(), 3);
+        assert_eq!(output.n_included_observations, 6);
+        let imbalanced = output
+            .results
+            .iter()
+            .find(|result| result.snv_id == "s1")
+            .unwrap();
+        assert_eq!(imbalanced.donor_count, 3);
+        assert_eq!(imbalanced.ref_count, 53);
+        assert_eq!(imbalanced.alt_count, 7);
+        assert!(imbalanced.mu > 0.75);
+        assert!(imbalanced.alt_ll >= imbalanced.null_ll);
+    }
+
+    #[test]
+    fn test_cohort_single_and_linear_return_nuisance_metadata() {
+        let single =
+            analyze_cohort_snvs(cohort_fixture(), &cohort_config(CohortSnvMethod::Single)).unwrap();
+        assert!(single.global_rho.is_some());
+        assert!(single.linear_params.is_none());
+        assert!(single.donor_dispersion.is_empty());
+
+        let linear =
+            analyze_cohort_snvs(cohort_fixture(), &cohort_config(CohortSnvMethod::Linear)).unwrap();
+        assert!(linear.global_rho.is_none());
+        assert!(linear.linear_params.is_some());
+        assert!(linear.donor_dispersion.is_empty());
+    }
+
+    #[test]
+    fn test_cohort_rejects_duplicate_donor_snv_observation() {
+        let mut observations = cohort_fixture();
+        observations.push(observations[0].clone());
+        let error = analyze_cohort_snvs(observations, &cohort_config(CohortSnvMethod::PerDonor))
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate donor/SNV"));
+    }
+
+    #[test]
+    fn test_cohort_allele_swap_preserves_lrt_and_flips_mu() {
+        let config = cohort_config(CohortSnvMethod::Single);
+        let original = analyze_cohort_snvs(cohort_fixture(), &config).unwrap();
+        let swapped_observations = cohort_fixture()
+            .into_iter()
+            .map(|mut observation| {
+                std::mem::swap(&mut observation.ref_allele, &mut observation.alt_allele);
+                std::mem::swap(&mut observation.ref_count, &mut observation.alt_count);
+                observation.snv_id = format!("{}_swap", observation.snv_id);
+                observation
+            })
+            .collect();
+        let swapped = analyze_cohort_snvs(swapped_observations, &config).unwrap();
+        for (left, right) in original.results.iter().zip(swapped.results.iter()) {
+            assert!((left.lrt - right.lrt).abs() < 1e-8);
+            assert!((left.pval - right.pval).abs() < 1e-8);
+            assert!((left.mu + right.mu - 1.0).abs() < 1e-6);
+        }
     }
 }

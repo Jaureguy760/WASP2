@@ -283,11 +283,9 @@ fn analyze_imbalance(
     let analysis_method = match method {
         "single" => analysis::AnalysisMethod::Single,
         "linear" => analysis::AnalysisMethod::Linear,
-        "per_donor" => analysis::AnalysisMethod::PerDonor,
         _ => {
             return Err(PyRuntimeError::new_err(format!(
-                "Unknown method: {}",
-                method
+                "Unknown legacy analysis method '{method}'; expected 'single' or 'linear'. Use the cohort-shared SNV API for donor-specific dispersion."
             )))
         }
     };
@@ -433,6 +431,196 @@ fn analyze_imbalance(
     }
 
     Ok(py_list.unbind().into_any())
+}
+
+fn parse_cohort_snv_method(method: &str) -> PyResult<analysis::CohortSnvMethod> {
+    match method {
+        "single" | "single-global" => Ok(analysis::CohortSnvMethod::Single),
+        "linear" => Ok(analysis::CohortSnvMethod::Linear),
+        "per-donor" => Ok(analysis::CohortSnvMethod::PerDonor),
+        _ => Err(PyRuntimeError::new_err(format!(
+            "Unknown cohort SNV method '{method}'; expected 'single', 'linear', or 'per-donor'"
+        ))),
+    }
+}
+
+fn read_cohort_snv_observations(tsv_path: &str) -> PyResult<Vec<analysis::CohortSnvObservation>> {
+    use flate2::read::MultiGzDecoder;
+    use std::collections::HashSet;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(tsv_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to open TSV: {e}")))?;
+    let mut reader: Box<dyn BufRead> = if tsv_path.ends_with(".gz") {
+        Box::new(BufReader::new(MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let mut header_line = String::new();
+    if reader
+        .read_line(&mut header_line)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read TSV header: {e}")))?
+        == 0
+    {
+        return Err(PyRuntimeError::new_err("Count TSV is empty"));
+    }
+    let headers: Vec<&str> = header_line
+        .trim_end_matches(['\r', '\n'])
+        .split('\t')
+        .collect();
+    let unique: HashSet<&str> = headers.iter().copied().collect();
+    if unique.len() != headers.len() {
+        return Err(PyRuntimeError::new_err(
+            "Count TSV contains duplicate column names",
+        ));
+    }
+    for name in [
+        "sample",
+        "snv_id",
+        "chrom",
+        "pos",
+        "ref",
+        "alt",
+        "ref_count",
+        "alt_count",
+    ] {
+        if !unique.contains(name) {
+            return Err(PyRuntimeError::new_err(format!(
+                "Required column '{name}' is missing from cohort SNV TSV"
+            )));
+        }
+    }
+    let index = |name: &str| {
+        headers
+            .iter()
+            .position(|header| *header == name)
+            .expect("required header checked")
+    };
+    let sample_idx = index("sample");
+    let snv_id_idx = index("snv_id");
+    let chrom_idx = index("chrom");
+    let pos_idx = index("pos");
+    let ref_idx = index("ref");
+    let alt_idx = index("alt");
+    let ref_count_idx = index("ref_count");
+    let alt_count_idx = index("alt_count");
+
+    let mut observations = Vec::new();
+    for (offset, line) in reader.lines().enumerate() {
+        let line_number = offset + 2;
+        let line = line.map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to read line {line_number}: {e}"))
+        })?;
+        if line.is_empty() {
+            return Err(PyRuntimeError::new_err(format!(
+                "Blank row at line {line_number}"
+            )));
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != headers.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "Line {line_number} has {} fields; expected {}",
+                fields.len(),
+                headers.len()
+            )));
+        }
+        let pos = fields[pos_idx].parse::<u32>().map_err(|e| {
+            PyRuntimeError::new_err(format!("Invalid pos at line {line_number}: {e}"))
+        })?;
+        let ref_count = fields[ref_count_idx].parse::<u32>().map_err(|e| {
+            PyRuntimeError::new_err(format!("Invalid ref_count at line {line_number}: {e}"))
+        })?;
+        let alt_count = fields[alt_count_idx].parse::<u32>().map_err(|e| {
+            PyRuntimeError::new_err(format!("Invalid alt_count at line {line_number}: {e}"))
+        })?;
+        observations.push(analysis::CohortSnvObservation {
+            sample: fields[sample_idx].to_string(),
+            snv_id: fields[snv_id_idx].to_string(),
+            chrom: fields[chrom_idx].to_string(),
+            pos,
+            ref_allele: fields[ref_idx].to_string(),
+            alt_allele: fields[alt_idx].to_string(),
+            ref_count,
+            alt_count,
+        });
+    }
+    Ok(observations)
+}
+
+/// Analyze exact SNVs across donors with one cohort-shared allelic effect.
+#[pyfunction]
+#[pyo3(signature = (tsv_path, min_count=10, pseudocount=1, method="per-donor", min_donor_observations=50, min_informative_donors=3))]
+fn analyze_cohort_snvs(
+    py: Python,
+    tsv_path: &str,
+    min_count: u32,
+    pseudocount: u32,
+    method: &str,
+    min_donor_observations: usize,
+    min_informative_donors: usize,
+) -> PyResult<Py<PyAny>> {
+    use pyo3::types::{PyDict, PyList};
+
+    let config = analysis::CohortSnvConfig {
+        min_count,
+        pseudocount,
+        min_donor_observations,
+        min_informative_donors,
+        method: parse_cohort_snv_method(method)?,
+    };
+    let observations = read_cohort_snv_observations(tsv_path)?;
+    let output = analysis::analyze_cohort_snvs(observations, &config)
+        .map_err(|e| PyRuntimeError::new_err(format!("Cohort SNV analysis failed: {e}")))?;
+
+    let results = PyList::empty(py);
+    for row in output.results {
+        let item = PyDict::new(py);
+        item.set_item("snv_id", row.snv_id)?;
+        item.set_item("chrom", row.chrom)?;
+        item.set_item("pos", row.pos)?;
+        item.set_item("ref", row.ref_allele)?;
+        item.set_item("alt", row.alt_allele)?;
+        item.set_item("ref_count", row.ref_count)?;
+        item.set_item("alt_count", row.alt_count)?;
+        item.set_item("N", row.n)?;
+        item.set_item("donor_count", row.donor_count)?;
+        item.set_item("null_ll", row.null_ll)?;
+        item.set_item("alt_ll", row.alt_ll)?;
+        item.set_item("mu", row.mu)?;
+        item.set_item("lrt", row.lrt)?;
+        item.set_item("pval", row.pval)?;
+        item.set_item("fdr_pval", row.fdr_pval)?;
+        results.append(item)?;
+    }
+    let donor_qc = PyList::empty(py);
+    for row in output.donor_qc {
+        let item = PyDict::new(py);
+        item.set_item("sample", row.sample)?;
+        item.set_item("raw_observations", row.raw_observations)?;
+        item.set_item("eligible_observations", row.eligible_observations)?;
+        item.set_item("included", row.included)?;
+        donor_qc.append(item)?;
+    }
+    let donor_dispersion = PyList::empty(py);
+    for row in output.donor_dispersion {
+        let item = PyDict::new(py);
+        item.set_item("sample", row.sample)?;
+        item.set_item("rho", row.rho)?;
+        item.set_item("n_observations", row.n_observations)?;
+        donor_dispersion.append(item)?;
+    }
+    let result = PyDict::new(py);
+    result.set_item("results", results)?;
+    result.set_item("donor_qc", donor_qc)?;
+    result.set_item("donor_dispersion", donor_dispersion)?;
+    result.set_item("method", method)?;
+    result.set_item("global_rho", output.global_rho)?;
+    result.set_item("linear_d1", output.linear_params.map(|params| params.0))?;
+    result.set_item("linear_d2", output.linear_params.map(|params| params.1))?;
+    result.set_item("n_raw_observations", output.n_raw_observations)?;
+    result.set_item("n_included_observations", output.n_included_observations)?;
+    Ok(result.unbind().into_any())
 }
 
 // ============================================================================
@@ -1000,6 +1188,7 @@ fn wasp2_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Analysis module (beta-binomial allelic imbalance detection)
     m.add_function(wrap_pyfunction!(analyze_imbalance, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_cohort_snvs, m)?)?;
 
     Ok(())
 }

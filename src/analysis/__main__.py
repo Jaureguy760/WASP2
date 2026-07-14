@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Annotated
 
 import typer
@@ -5,8 +6,14 @@ import typer
 from wasp2.cli import create_version_callback, verbosity_callback
 
 from .run_analysis import run_ai_analysis
-from .run_analysis_sc import run_ai_analysis_sc
-from .run_compare_ai import run_ai_comparison
+
+
+class AnalysisScopeChoice(str, Enum):
+    cohort_shared = "cohort-shared"
+
+
+class AnalysisUnitChoice(str, Enum):
+    snv = "snv"
 
 
 def _get_analysis_deps() -> dict[str, str]:
@@ -104,7 +111,8 @@ def find_imbalance(
             help=(
                 "Model used for measuring optimization parameter when finding imbalance. "
                 "HIGHLY RECOMMENDED TO LEAVE AS DEFAULT FOR SINGLE DISPERSION MODEL. "
-                "Choice of 'single' or 'linear'. (Default: 'single')"
+                "Legacy choices are 'single' or 'linear'. Cohort-shared SNVs also accept "
+                "'per-donor', which is their default."
             ),
         ),
     ] = None,
@@ -142,6 +150,40 @@ def find_imbalance(
             ),
         ),
     ] = False,
+    scope: Annotated[
+        AnalysisScopeChoice | None,
+        typer.Option(
+            "--scope",
+            help="Run cohort-shared SNV inference using donor-preserving count rows.",
+        ),
+    ] = None,
+    unit: Annotated[
+        AnalysisUnitChoice | None,
+        typer.Option("--unit", help="Statistical unit for cohort-shared analysis."),
+    ] = None,
+    min_donor_observations: Annotated[
+        int,
+        typer.Option(
+            "--min-donor-observations",
+            min=1,
+            help="Exclude donors with fewer eligible count observations from inference.",
+        ),
+    ] = 50,
+    min_informative_donors: Annotated[
+        int,
+        typer.Option(
+            "--min-informative-donors",
+            min=1,
+            help="Minimum included donors required to test a cohort-shared SNV.",
+        ),
+    ] = 3,
+    expected_sha256: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-sha256",
+            help="Fail unless the cohort count input has this SHA-256 digest.",
+        ),
+    ] = None,
 ) -> None:
     run_ai_analysis(
         count_file=counts,
@@ -153,6 +195,11 @@ def find_imbalance(
         region_col=region_col,
         groupby=groupby,
         per_variant=per_variant,
+        scope=scope.value if scope is not None else None,
+        unit=unit.value if unit is not None else None,
+        min_donor_observations=min_donor_observations,
+        min_informative_donors=min_informative_donors,
+        expected_sha256=expected_sha256,
     )
 
 
@@ -234,6 +281,13 @@ def find_imbalance_sc(
         ),
     ] = None,
 ) -> None:
+    try:
+        from .run_analysis_sc import run_ai_analysis_sc
+    except (ImportError, ModuleNotFoundError) as error:
+        raise typer.BadParameter(
+            "Single-cell analysis dependencies are not available in this environment"
+        ) from error
+
     run_ai_analysis_sc(
         count_file=counts,
         bc_map=bc_map,
@@ -325,6 +379,13 @@ def compare_imbalance(
         ),
     ] = None,
 ) -> None:
+    try:
+        from .run_compare_ai import run_ai_comparison
+    except (ImportError, ModuleNotFoundError) as error:
+        raise typer.BadParameter(
+            "Single-cell comparison dependencies are not available in this environment"
+        ) from error
+
     run_ai_comparison(
         count_file=counts,
         bc_map=bc_map,

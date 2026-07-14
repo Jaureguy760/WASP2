@@ -43,6 +43,47 @@ class ImbalanceResult(TypedDict):
     pval: float
     fdr_pval: float
 
+class CohortSnvResult(TypedDict):
+    """One shared-effect cohort SNV result."""
+
+    snv_id: str
+    chrom: str
+    pos: int
+    ref: str
+    alt: str
+    ref_count: int
+    alt_count: int
+    N: int
+    donor_count: int
+    null_ll: float
+    alt_ll: float
+    mu: float
+    lrt: float
+    pval: float
+    fdr_pval: float
+
+class CohortDonorQc(TypedDict):
+    sample: str
+    raw_observations: int
+    eligible_observations: int
+    included: bool
+
+class CohortDonorDispersion(TypedDict):
+    sample: str
+    rho: float
+    n_observations: int
+
+class CohortSnvRun(TypedDict):
+    results: list[CohortSnvResult]
+    donor_qc: list[CohortDonorQc]
+    donor_dispersion: list[CohortDonorDispersion]
+    method: str
+    global_rho: float | None
+    linear_d1: float | None
+    linear_d2: float | None
+    n_raw_observations: int
+    n_included_observations: int
+
 class VariantSpan(TypedDict):
     """Variant span information from intersection parsing."""
 
@@ -580,4 +621,15 @@ def analyze_imbalance(
     list[ImbalanceResult]
         List of imbalance results per region.
     """
+    ...
+
+def analyze_cohort_snvs(
+    tsv_path: str,
+    min_count: int = 10,
+    pseudocount: int = 1,
+    method: str = "per-donor",
+    min_donor_observations: int = 50,
+    min_informative_donors: int = 3,
+) -> CohortSnvRun:
+    """Analyze exact SNVs across donors with one shared allelic effect."""
     ...
